@@ -1,0 +1,58 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit(//vault/**)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git blame:*)",
+      "Bash(git diff:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git ls-files:*)",
+      "Bash(rg:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(tree:*)",
+      "Bash(events:*)",
+      "Bash(inbox-file /notes/:*)",
+      "Bash(cat /notes/:*)",
+      "Bash(stat /notes/:*)",
+      "Bash(creds list)",
+      "Bash(creds check)",
+      "Bash(contributions:*)",
+      "Bash(git -C /src/:*)",
+      "Bash(vault-links:*)",
+      "Bash(vault-index:*)",
+      "Bash(vault-search:*)"
+    ],
+    "deny": [
+      "Edit(//src/**)",
+      "Edit(//opt/scientia/**)",
+      "Edit(//vault/_templates/**)",
+      "Edit(//notes/**)",
+      "Read(~/.config/scientia/creds)",
+      "Bash(sed -i:*)",
+      "Bash(sed --in-place:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(perl:*)",
+      "Bash(awk -i:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/scientia/claude/hooks/bash-write-guard"
+          }
+        ]
+      }
+    ]
+  }
+}

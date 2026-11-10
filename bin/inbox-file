@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Move a filed inbox drop into processed/ next to it, and print where it went.
+
+If processed/ already holds that name, the received time (the drop's mtime) is
+prefixed, so earlier drops are never overwritten.
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("drop", type=Path)
+    drop = parser.parse_args().drop
+
+    if not drop.is_file():
+        parser.error(f"{drop} is not a file")
+    if drop.parent.name == "processed":
+        parser.error(f"{drop} is already processed")
+
+    processed = drop.parent / "processed"
+    processed.mkdir(exist_ok=True)
+    target = processed / drop.name
+    if target.exists():
+        received = time.strftime("%Y%m%d-%H%M", time.localtime(drop.stat().st_mtime))
+        target = processed / f"{received} {drop.name}"
+    if target.exists():
+        parser.error(f"{target} already exists")
+
+    drop.rename(target)
+    print(target)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# Runs Claude Code in a sandbox: source dirs read-only under /src, the Obsidian vault
+# writeable at /vault, an optional notes inbox at /notes, and an scientia-only ~/.claude.
+# The agent starts on /start (events, journal, inbox).
+#
+# bwrap (Linux) and docker mount the logical paths as given; docker runs an image built
+# from docker/Dockerfile, as the invoking user. seatbelt (macOS sandbox-exec) cannot remap
+# paths, so the agent works on host paths, exported as SCIENTIA_* and listed in its system
+# prompt. Bash 3.2-compatible.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+usage() {
+    cat <<EOF
+usage: scientia [options] SRC_DIR... [-- ARGS...]
+
+  --vault DIR   Obsidian vault, mounted writeable at /vault (default: \$PWD)
+                --vault, --config and --notes dirs are created if missing
+  --config DIR  Claude config, mounted as ~/.claude
+                (default: \${SCIENTIA_CONFIG:-~/.config/scientia/claude})
+  --notes DIR   notes inbox, mounted at /notes and watched from /start
+                (default: \${SCIENTIA_NOTES:-none})
+  --no-start    do not start claude on /start (no watcher, journal or inbox)
+  --creds FILE  access tokens, mounted read-only for bin/creds (see bin/creds)
+                (default: \${SCIENTIA_CREDS:-~/.config/scientia/creds}, if present)
+  --shell       run bash instead of claude
+  --sandbox S   bwrap, seatbelt, docker or auto (default: \${SCIENTIA_SANDBOX:-auto}):
+                bwrap on Linux, else docker; docker on macOS if running, else seatbelt
+  --dry-run     print the sandbox command, one argument per line, and exit
+  ARGS          passed to claude (or bash with --shell)
+EOF
+}
+
+die() {
+    echo "scientia: $1" >&2
+    exit 2
+}
+
+vault="$PWD"
+config="${SCIENTIA_CONFIG:-$HOME/.config/scientia/claude}"
+notes="${SCIENTIA_NOTES:-}"
+creds="${SCIENTIA_CREDS:-$HOME/.config/scientia/creds}"
+creds_required=0
+start_session=1
+dry_run=0
+command=claude
+sources=()
+passthrough=()
+sandbox="${SCIENTIA_SANDBOX:-auto}"
+# Test hook: exercise the macOS path's dry run from Linux.
+platform="${SCIENTIA_PLATFORM:-$(uname -s)}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --vault) vault="${2:?--vault needs a directory}"; shift 2 ;;
+        --config) config="${2:?--config needs a directory}"; shift 2 ;;
+        --notes) notes="${2:?--notes needs a directory}"; shift 2 ;;
+        --no-start) start_session=0; shift ;;
+        --creds) creds="${2:?--creds needs a file}"; creds_required=1; shift 2 ;;
+        --shell) command=bash; shift ;;
+        --sandbox) sandbox="${2:?--sandbox needs a name}"; shift 2 ;;
+        --dry-run) dry_run=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; passthrough=("$@"); break ;;
+        -*) usage >&2; die "unknown option $1" ;;
+        *) sources+=("$1"); shift ;;
+    esac
+done
+
+[ ${#sources[@]} -gt 0 ] || { usage >&2; die "no source directories given"; }
+mkdir -p "$vault" 2>/dev/null || die "vault $vault is not a directory"
+
+if [ "$sandbox" = auto ]; then
+    if [ "$platform" = Linux ]; then
+        if command -v bwrap >/dev/null || ! command -v docker >/dev/null; then sandbox=bwrap; else sandbox=docker; fi
+    elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+        sandbox=docker
+    else
+        sandbox=seatbelt
+    fi
+fi
+case "$sandbox" in
+    bwrap|seatbelt|docker) ;;
+    *) die "unknown sandbox $sandbox" ;;
+esac
+
+# The host's claude, for the sandboxes that share the host's binaries.
+if [ "$sandbox" != docker ]; then
+    claude_bin="$(command -v claude)" || die "claude not found on PATH"
+    claude_target="$(readlink -f "$claude_bin")"
+    claude_install="$HOME/.local/share/claude"
+    # The claude launcher symlink points into its versioned install dir.
+    if [[ "$claude_target" == "$claude_install"/* ]]; then
+        claude_root="$claude_install"
+    else
+        claude_root="$claude_target"
+    fi
+fi
+
+mkdir -p "$config"
+vault="$(readlink -f "$vault")"
+config="$(readlink -f "$config")"
+
+if [ -z "$(ls -A "$vault")" ]; then
+    cp -a "$REPO/vault-template/." "$vault/"
+fi
+
+if [ -n "$notes" ]; then
+    mkdir -p "$notes" 2>/dev/null || die "notes inbox $notes is not a directory"
+    notes="$(readlink -f "$notes")"
+    mkdir -p "$notes/processed"
+fi
+
+use_creds=0
+if [ -e "$creds" ] || [ "$creds_required" = 1 ]; then
+    "$REPO/bin/creds" --file "$creds" check || die "credentials file $creds is invalid"
+    creds="$(readlink -f "$creds")"
+    use_creds=1
+fi
+
+# Sources resolved, mounted by basename; basenames must be unique.
+src_paths=()
+src_names=()
+for src in "${sources[@]}"; do
+    [ -d "$src" ] || die "source $src is not a directory"
+    src="$(readlink -f "$src")"
+    name="$(basename "$src")"
+    for i in ${src_names[@]+"${!src_names[@]}"}; do
+        [ "${src_names[$i]}" != "$name" ] || die "sources ${src_paths[$i]} and $src share the name $name"
+    done
+    src_paths+=("$src")
+    src_names+=("$name")
+done
+
+user="${USER:-$(id -un)}"
+# Journal authors: git --author patterns. The system user's full name, else login name;
+# /journal confirms the matching identities with the human on its first run.
+authors="${SCIENTIA_AUTHORS:-}"
+if [ -z "$authors" ]; then
+    if [ "$platform" = Darwin ]; then
+        authors="$(id -F "$user" 2>/dev/null || true)"
+    else
+        authors="$(getent passwd "$user" | cut -d: -f5 | cut -d, -f1)"
+    fi
+    authors="${authors:-$user}"
+fi
+
+# Environment inside the sandbox, as NAME=VALUE; $1 is the Claude config dir there.
+# The logical paths are set per platform.
+base_env() {
+    env_vars=(
+        "HOME=$HOME"
+        "USER=$user"
+        "TERM=${TERM:-xterm-256color}"
+        "LANG=${LANG:-C.UTF-8}"
+        "CLAUDE_CONFIG_DIR=$1"
+        "DISABLE_AUTOUPDATER=1"
+        "SCIENTIA=1"
+        # Sources are owned by the invoking user but git still refuses some
+        # cross-mount repos; nothing here is writeable anyway.
+        "GIT_CONFIG_COUNT=1"
+        "GIT_CONFIG_KEY_0=safe.directory"
+        "GIT_CONFIG_VALUE_0=*"
+        "SCIENTIA_AUTHORS=$authors"
+    )
+    local var
+    for var in COLORTERM ANTHROPIC_API_KEY ANTHROPIC_BASE_URL SCIENTIA_ASK_INTERVAL SCIENTIA_JOURNAL_AT SCIENTIA_INDEX_INTERVAL; do
+        if [ -n "${!var:-}" ]; then
+            env_vars+=("$var=${!var}")
+        fi
+    done
+}
+
+cmd=("$command")
+
+finish_cmd() {
+    cmd+=(${passthrough[@]+"${passthrough[@]}"})
+    if [ "$command" = claude ] && [ "$start_session" = 1 ]; then
+        cmd+=(/start)
+    fi
+}
+
+run_bwrap() {
+    local args i entry
+    args=(
+        --unshare-all --share-net --die-with-parent
+        --ro-bind /usr /usr
+        --symlink usr/bin /bin
+        --symlink usr/sbin /sbin
+        --symlink usr/lib /lib
+        --symlink usr/lib64 /lib64
+        --symlink usr/lib32 /lib32
+        --ro-bind /etc /etc
+        --ro-bind-try /run/systemd/resolve /run/systemd/resolve
+        --proc /proc
+        --dev /dev
+        --tmpfs /tmp
+        --tmpfs "$HOME"
+        --ro-bind "$REPO" /opt/scientia
+        --bind "$config" "$HOME/.claude"
+        --ro-bind "$REPO/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+        --ro-bind "$REPO/claude/settings.json" "$HOME/.claude/settings.json"
+        --ro-bind "$REPO/claude/skills" "$HOME/.claude/skills"
+        --bind "$vault" /vault
+        --chdir /vault
+        --ro-bind "$claude_root" "$claude_root"
+        --symlink "$claude_target" "$HOME/.local/bin/claude"
+    )
+    [ -z "$notes" ] || args+=(--bind "$notes" /notes)
+    # Tokens are only reachable through bin/creds, never exported into the sandbox env.
+    local creds_mount="$HOME/.config/scientia/creds"
+    [ "$use_creds" = 0 ] || args+=(--ro-bind "$creds" "$creds_mount")
+    for i in "${!src_paths[@]}"; do
+        args+=(--ro-bind "${src_paths[$i]}" "/src/${src_names[$i]}")
+    done
+
+    base_env "$HOME/.claude"
+    env_vars+=(
+        "PATH=$HOME/.local/bin:/opt/scientia/bin:/usr/local/bin:/usr/bin:/bin"
+        "SCIENTIA_SRC=/src"
+        "SCIENTIA_VAULT=/vault"
+        "SCIENTIA_HOME=/opt/scientia"
+        "SCIENTIA_SCRATCH=/tmp"
+    )
+    [ -z "$notes" ] || env_vars+=("SCIENTIA_NOTES_DIR=/notes")
+    [ "$use_creds" = 0 ] || env_vars+=("SCIENTIA_CREDS=$creds_mount")
+    args+=(--clearenv)
+    for entry in "${env_vars[@]}"; do
+        args+=(--setenv "${entry%%=*}" "${entry#*=}")
+    done
+
+    finish_cmd
+    if [ "$dry_run" = 1 ]; then
+        printf '%s\n' bwrap "${args[@]}" "${cmd[@]}"
+        exit 0
+    fi
+    exec bwrap "${args[@]}" "${cmd[@]}"
+}
+
+# Seatbelt string literal.
+sb() {
+    local s="${1//\\/\\\\}"
+    printf '"%s"' "${s//\"/\\\"}"
+}
+
+# sed replacement text, for the '#' delimiter.
+sed_rhs() {
+    printf '%s' "$1" | sed 's/[#&\\]/\\&/g'
+}
+
+run_seatbelt() {
+    local run="$HOME/.scientia/run/$$"
+    local scratch="$run/tmp"
+    local i p dir
+
+    # Generated config: the repo's, with logical paths replaced by host paths.
+    # Seatbelt keeps them read-only; skills is a symlink into the repo.
+    local rules=(
+        -e "s#(//vault/#(/$(sed_rhs "$vault")/#g"
+        -e "s#(//src/#(/$(sed_rhs "$run/src")/#g"
+        -e "s#(//opt/scientia/#(/$(sed_rhs "$REPO")/#g"
+        -e "s# /src/# $(sed_rhs "$run/src")/#g"
+        -e "s#\"/opt/scientia/#\"$(sed_rhs "$REPO")/#g"
+        -e "s#@/opt/scientia/#@$(sed_rhs "$REPO")/#g"
+    )
+    if [ -n "$notes" ]; then
+        rules+=(-e "s#(//notes/#(/$(sed_rhs "$notes")/#g" -e "s# /notes/# $(sed_rhs "$notes")/#g")
+    fi
+    [ "$use_creds" = 0 ] || rules+=(-e "s#Read(~/.config/scientia/creds)#Read(/$(sed_rhs "$creds"))#g")
+    sed "${rules[@]}" "$REPO/claude/settings.json" > "$config/settings.json"
+    sed "${rules[@]}" "$REPO/claude/CLAUDE.md" > "$config/CLAUDE.md"
+    if [ -d "$config/skills" ] && [ ! -L "$config/skills" ]; then
+        rmdir "$config/skills" 2>/dev/null || die "$config/skills is a directory; remove it"
+    fi
+    ln -sfn "$REPO/claude/skills" "$config/skills"
+
+    # Per-user system temp and cache dirs: xcrun, Security and friends write there.
+    local darwin_dirs=()
+    for p in DARWIN_USER_TEMP_DIR DARWIN_USER_CACHE_DIR; do
+        dir="$(getconf "$p" 2>/dev/null || true)"
+        [ -z "$dir" ] || darwin_dirs+=("$(readlink -f "$dir" 2>/dev/null || echo "$dir")")
+    done
+
+    # Readable, beyond what (allow default) leaves: hidden trees are $HOME, /Volumes, /tmp.
+    local readable=("$REPO" "$vault" "$config" "$run" "$claude_root" "${src_paths[@]}")
+    [ -z "$notes" ] || readable+=("$notes")
+    local writable=("$vault" "$config" "$scratch" /dev ${darwin_dirs[@]+"${darwin_dirs[@]}"})
+    [ -z "$notes" ] || writable+=("$notes")
+
+    local profile
+    profile="(version 1)
+(allow default)
+(deny file-read* (subpath $(sb "$(readlink -f "$HOME")")) (subpath \"/Volumes\") (subpath \"/private/tmp\"))
+(allow file-read*"
+    for p in "${readable[@]}"; do profile+=" (subpath $(sb "$p"))"; done
+    profile+=" (literal $(sb "$claude_bin"))"
+    [ "$use_creds" = 0 ] || profile+=" (literal $(sb "$creds"))"
+    profile+=")
+(allow file-read-metadata"
+    # Ancestors, for getcwd and realpath; their other entries stay hidden.
+    for p in "${readable[@]}" "$claude_bin" ${darwin_dirs[@]+"${darwin_dirs[@]}"}; do
+        p="$(dirname "$p")"
+        while [ "$p" != / ]; do
+            [[ "$profile" == *"(literal $(sb "$p"))"* ]] || profile+=" (literal $(sb "$p"))"
+            p="$(dirname "$p")"
+        done
+    done
+    profile+=")
+(deny file-write* (subpath \"/\"))
+(allow file-write*"
+    for p in "${writable[@]}"; do profile+=" (subpath $(sb "$p"))"; done
+    profile+=")
+(deny file-write* (subpath $(sb "$REPO")) (subpath $(sb "$vault/_templates"))"
+    for p in CLAUDE.md settings.json skills; do profile+=" (literal $(sb "$config/$p"))"; done
+    for p in "${src_paths[@]}"; do profile+=" (subpath $(sb "$p"))"; done
+    profile+=")"
+
+    local path="$run/bin:$REPO/bin"
+    [ ! -d /opt/homebrew/bin ] || path+=":/opt/homebrew/bin"
+    path+=":/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    base_env "$config"
+    env_vars+=(
+        "PATH=$path"
+        "TMPDIR=$scratch/"
+        "SCIENTIA_SRC=$run/src"
+        "SCIENTIA_VAULT=$vault"
+        "SCIENTIA_HOME=$REPO"
+        "SCIENTIA_SCRATCH=$scratch"
+    )
+    [ -z "$notes" ] || env_vars+=("SCIENTIA_NOTES_DIR=$notes")
+    [ "$use_creds" = 0 ] || env_vars+=("SCIENTIA_CREDS=$creds")
+
+    if [ "$command" = claude ]; then
+        local prompt="This host has no /src, /vault, /notes or /opt/scientia. Wherever AGENTS.md, CLAUDE.md or a skill names one of these paths, use the host path:
+- /src = $run/src
+- /vault = $vault
+- /opt/scientia = $REPO
+- /tmp = $scratch"
+        [ -z "$notes" ] || prompt+="
+- /notes = $notes"
+        cmd+=(--append-system-prompt "$prompt")
+    fi
+    finish_cmd
+
+    local launch=(env -i "${env_vars[@]}" sandbox-exec -p "$profile" "${cmd[@]}")
+    if [ "$dry_run" = 1 ]; then
+        printf '%s\n' "${launch[@]}"
+        exit 0
+    fi
+
+    # Sessions of launchers that died without cleaning up.
+    for dir in "$HOME/.scientia/run"/*; do
+        [ -d "$dir" ] || continue
+        kill -0 "$(basename "$dir")" 2>/dev/null || rm -rf "$dir"
+    done
+    rm -rf "$run"
+    mkdir -p "$run/src" "$run/bin" "$scratch"
+    trap 'rm -rf "$run"' EXIT
+    for i in "${!src_paths[@]}"; do
+        ln -s "${src_paths[$i]}" "$run/src/${src_names[$i]}"
+    done
+    ln -s "$claude_target" "$run/bin/claude"
+    cd "$vault"
+    "${launch[@]}"
+}
+
+run_docker() {
+    local home=/home/scientia
+    local image="${SCIENTIA_IMAGE:-scientia:$(cksum < "$REPO/docker/Dockerfile" | cut -d' ' -f1)}"
+    local args=(run --rm -i --init --read-only --cap-drop ALL --security-opt no-new-privileges)
+    local i entry
+
+    [ ! -t 0 ] || args+=(-t)
+    # Rootless docker maps container root to the invoking user; elsewhere run as that user.
+    if [[ "$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)" != *rootless* ]]; then
+        args+=(--user "$(id -u):$(id -g)")
+    fi
+    # Repo config mounts over the config dir; the mountpoints must exist and be plain.
+    [ ! -L "$config/skills" ] || rm "$config/skills"
+    mkdir -p "$config/skills"
+    for entry in CLAUDE.md settings.json; do
+        [ -f "$config/$entry" ] || touch "$config/$entry"
+    done
+
+    args+=(
+        --tmpfs /tmp
+        --tmpfs "$home:mode=1777"
+        --mount "type=bind,src=$REPO,dst=/opt/scientia,readonly"
+        --mount "type=bind,src=$config,dst=$home/.claude"
+        --mount "type=bind,src=$REPO/claude/CLAUDE.md,dst=$home/.claude/CLAUDE.md,readonly"
+        --mount "type=bind,src=$REPO/claude/settings.json,dst=$home/.claude/settings.json,readonly"
+        --mount "type=bind,src=$REPO/claude/skills,dst=$home/.claude/skills,readonly"
+        --mount "type=bind,src=$vault,dst=/vault"
+        --workdir /vault
+    )
+    [ -z "$notes" ] || args+=(--mount "type=bind,src=$notes,dst=/notes")
+    local creds_mount="$home/.config/scientia/creds"
+    [ "$use_creds" = 0 ] || args+=(--mount "type=bind,src=$creds,dst=$creds_mount,readonly")
+    for i in "${!src_paths[@]}"; do
+        args+=(--mount "type=bind,src=${src_paths[$i]},dst=/src/${src_names[$i]},readonly")
+    done
+
+    HOME="$home" base_env "$home/.claude"
+    env_vars+=(
+        "PATH=/opt/scientia/bin:/usr/local/bin:/usr/bin:/bin"
+        "SCIENTIA_SRC=/src"
+        "SCIENTIA_VAULT=/vault"
+        "SCIENTIA_HOME=/opt/scientia"
+        "SCIENTIA_SCRATCH=/tmp"
+    )
+    [ -z "$notes" ] || env_vars+=("SCIENTIA_NOTES_DIR=/notes")
+    [ "$use_creds" = 0 ] || env_vars+=("SCIENTIA_CREDS=$creds_mount")
+    for entry in "${env_vars[@]}"; do
+        args+=(-e "$entry")
+    done
+
+    finish_cmd
+    if [ "$dry_run" = 1 ]; then
+        printf '%s\n' docker "${args[@]}" "$image" "${cmd[@]}"
+        exit 0
+    fi
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "scientia: building $image" >&2
+        docker build -q -t "$image" "$REPO/docker" >&2
+    fi
+    exec docker "${args[@]}" "$image" "${cmd[@]}"
+}
+
+case "$sandbox" in
+    bwrap) run_bwrap ;;
+    seatbelt) run_seatbelt ;;
+    docker) run_docker ;;
+esac

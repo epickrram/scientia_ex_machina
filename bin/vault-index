@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Full-text index of the vault's notes in SQLite FTS5 (vault-index), and search (vault-search).
+
+    vault-index [--rebuild]              index new and changed notes, drop removed ones
+    vault-search [--raw] [--limit N] Q   ranked matches: "<path> — <title>" then a snippet
+
+The index lives at <vault>/.scientia/index.sqlite, which Obsidian does not show. Notes
+under hidden folders and _templates/ are skipped. Title, headings, frontmatter tags and
+aliases, and body are indexed with Porter stemming. Notes whose title matches the whole
+query come first; the rest rank by bm25, weighting title, headings, tags, then body. Plain queries match every word (`word*` for a prefix)
+and treat punctuation literally; --raw passes FTS5 query syntax (OR, NEAR, "phrases").
+"""
+
+import argparse
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+SKIPPED_DIRS = {"_templates"}
+WEIGHTS = "0, 50.0, 10.0, 5.0, 1.0"  # path (unindexed), title, headings, tags, body
+
+
+def database(vault):
+    return vault / ".scientia" / "index.sqlite"
+
+
+def notes(vault):
+    """{relative path: (size, mtime_ns)} for every indexable note."""
+    found = {}
+    for root, dirs, files in os.walk(vault):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIPPED_DIRS)
+        for name in files:
+            if name.endswith(".md") and not name.startswith("."):
+                path = Path(root, name)
+                stat = path.stat()
+                found[path.relative_to(vault).as_posix()] = (stat.st_size, stat.st_mtime_ns)
+    return found
+
+
+def frontmatter_list(frontmatter, key):
+    block = re.search(rf"^{key}:[ \t]*(.*?)(?=^\S|\Z)", frontmatter, re.M | re.S)
+    if not block:
+        return []
+    value = block.group(1).strip()
+    if value.startswith("["):
+        items = value.strip("[]").split(",")
+    elif value:
+        items = [value] if "\n" not in value else []
+    else:
+        items = []
+    items += [line.strip()[1:] for line in value.splitlines() if line.strip().startswith("-")]
+    return [item.strip().strip("'\"") for item in items if item.strip().strip("'\"")]
+
+
+def parse(path, text):
+    match = FRONTMATTER.match(text)
+    frontmatter = match.group(1) if match else ""
+    body = text[match.end():] if match else text
+    title = re.search(r"^# (.+)$", body, re.M)
+    headings = re.findall(r"^#{2,6} (.+)$", body, re.M)
+    tags = frontmatter_list(frontmatter, "tags") + frontmatter_list(frontmatter, "aliases")
+    return (title.group(1).strip() if title else Path(path).stem,
+            "\n".join(headings), " ".join(tags), body)
+
+
+def connect(path):
+    path.parent.mkdir(exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS notes (path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, title TEXT);
+        CREATE VIRTUAL TABLE IF NOT EXISTS docs
+            USING fts5(path UNINDEXED, title, headings, tags, body, tokenize='porter unicode61');
+    """)
+    return connection
+
+
+def indexed(connection):
+    return {path: (size, mtime) for path, size, mtime in connection.execute("SELECT path, size, mtime FROM notes")}
+
+
+def build(vault, rebuild):
+    db = database(vault)
+    if rebuild and db.exists():
+        db.unlink()
+    connection = connect(db)
+    current = notes(vault)
+    known = indexed(connection)
+    added = removed = unchanged = 0
+    with connection:
+        for path in known.keys() - current.keys():
+            connection.execute("DELETE FROM docs WHERE path = ?", (path,))
+            connection.execute("DELETE FROM notes WHERE path = ?", (path,))
+            removed += 1
+        for path, signature in sorted(current.items()):
+            if known.get(path) == signature:
+                unchanged += 1
+                continue
+            title, headings, tags, body = parse(path, (vault / path).read_text(errors="replace"))
+            connection.execute("DELETE FROM docs WHERE path = ?", (path,))
+            connection.execute("INSERT INTO docs VALUES (?, ?, ?, ?, ?)", (path, title, headings, tags, body))
+            connection.execute("INSERT OR REPLACE INTO notes VALUES (?, ?, ?, ?)", (path, *signature, title))
+            added += 1
+    print(f"indexed {added}, removed {removed}, unchanged {unchanged}")
+    return 0
+
+
+def plain_query(query):
+    terms = []
+    for word in query.split():
+        prefix = word.endswith("*")
+        word = word.rstrip("*")
+        if word:
+            terms.append('"' + word.replace('"', '""') + '"' + ("*" if prefix else ""))
+    return " ".join(terms)
+
+
+def search(vault, query, raw, limit):
+    db = database(vault)
+    if not db.exists():
+        print(f"vault-search: no index at {db}; run vault-index", file=sys.stderr)
+        return 2
+    connection = connect(db)
+    current, known = notes(vault), indexed(connection)
+    behind = len(current.keys() ^ known.keys()) + sum(
+        1 for path in current.keys() & known.keys() if current[path] != known[path])
+    if behind:
+        noun = "change" if behind == 1 else "changes"
+        print(f"vault-search: index is {behind} {noun} behind the vault; run vault-index", file=sys.stderr)
+
+    expression = query if raw else plain_query(query)
+    if not expression:
+        return 0
+    try:
+        # Notes whose title matches come first; bm25 alone lets long bodies with many
+        # mentions outrank the note that is about the subject.
+        rows = connection.execute(
+            f"SELECT path, title, snippet(docs, 4, '[', ']', '…', 12) FROM docs WHERE docs MATCH ? "
+            f"ORDER BY rowid IN (SELECT rowid FROM docs WHERE docs MATCH ?) DESC, bm25(docs, {WEIGHTS}) "
+            f"LIMIT ?", (expression, f"title : ({expression})", limit)).fetchall()
+    except sqlite3.OperationalError as error:
+        print(f"vault-search: bad query ({error})", file=sys.stderr)
+        return 2
+    for path, title, snippet in rows:
+        print(f"{path} — {title}")
+        print("  " + " ".join(snippet.split()))
+    return 0
+
+
+def main():
+    searching = Path(sys.argv[0]).name == "vault-search"
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--vault", type=Path, default=Path(os.environ.get("SCIENTIA_VAULT") or "/vault"))
+    if searching:
+        parser.add_argument("--raw", action="store_true", help="FTS5 query syntax")
+        parser.add_argument("--limit", type=int, default=10)
+        parser.add_argument("query", nargs="+")
+    else:
+        parser.add_argument("--rebuild", action="store_true", help="drop the index and start again")
+    args = parser.parse_args()
+    if not args.vault.is_dir():
+        parser.error(f"{args.vault} is not a directory")
+    if searching:
+        return search(args.vault, " ".join(args.query), args.raw, args.limit)
+    return build(args.vault, args.rebuild)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook: refuse Bash commands that write files outside /tmp.
+
+Vault notes are edited with the file-editing tools, so every change is visible and
+reviewable; shell scripts (sed -i, interpreters, redirection) bypass that. Allowed writes:
+anything under /tmp, /dev/null and file-descriptor redirects, `rm` of notes with no content
+(the empty stubs /links replaces), and the scientia helpers, which run by name.
+$SCIENTIA_SCRATCH overrides the scratch root, for tests.
+
+Every command position is checked: chains (; && || |), subshells, $(...) and backticks,
+heredoc-free text, `sh -c`, `find -exec`, `xargs`, `env`/`timeout`-style wrappers and
+`creds run`. Anything unparseable is refused. Exit 2 blocks and shows stderr to the agent.
+"""
+
+import json
+import os
+import re
+import shlex
+import sys
+
+SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;"}
+INTERPRETER = re.compile(r"^(python[\d.]*|perl[\d.]*|ruby|node|nodejs|php|lua[\d.]*|tclsh|osascript)$")
+EDITORS = {"vi", "vim", "nvim", "nano", "emacs", "ed", "ex"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+ALL_PATHS_WRITTEN = {"mv", "touch", "truncate", "mkdir", "rmdir", "chmod", "chown", "shred",
+                     "unlink", "ln", "mkfifo"}
+DESTINATION_WRITTEN = {"cp", "install", "rsync", "scp"}
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+FRONTMATTER = re.compile(r"\A---\n.*?\n---\n", re.S)
+
+
+class Blocked(Exception):
+    pass
+
+
+class Guard:
+    def __init__(self, cwd, scratch):
+        self.cwd = cwd
+        self.scratch = os.path.normpath(scratch)
+
+    def allowed(self, path):
+        if path in ("-", "/dev/null", "/dev/stdout", "/dev/stderr"):
+            return True
+        resolved = os.path.normpath(os.path.join(self.cwd, path))
+        return resolved == self.scratch or resolved.startswith(self.scratch + "/")
+
+    def empty_note(self, path):
+        resolved = os.path.join(self.cwd, path)
+        try:
+            with open(resolved, errors="replace") as note:
+                return os.path.isfile(resolved) and not FRONTMATTER.sub("", note.read(), count=1).strip()
+        except OSError:
+            return False
+
+    def require(self, path, what):
+        if not self.allowed(path):
+            raise Blocked(f"{what} writes {path}")
+
+    def check(self, command):
+        command = self.check_substitutions(command)
+        command = strip_heredoc_bodies(command).replace("\n", " ; ")
+        try:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError as error:
+            raise Blocked(f"cannot parse the command ({error}); simplify it")
+        segment = []
+        for token in tokens + [";"]:
+            if token in SEPARATORS:
+                self.check_segment(segment)
+                segment = []
+            else:
+                segment.append(token)
+
+    def check_substitutions(self, command):
+        """Check each $(...) and `...` on its own, then drop it from the outer command."""
+        pattern = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+        while True:
+            match = pattern.search(command)
+            if not match:
+                return command
+            self.check(match.group(1) if match.group(1) is not None else match.group(2))
+            command = command[:match.start()] + "SUBSTITUTION" + command[match.end():]
+
+    def check_segment(self, tokens):
+        words = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if ">" in token and set(token) <= set("<>&|"):
+                if not (token in (">&", "<&") and (target.isdigit() or target == "-")):
+                    self.require(target, "redirection")
+                index += 2
+            elif set(token) <= set("<"):
+                index += 2
+            else:
+                words.append(token)
+                index += 1
+        self.check_words(words)
+
+    def check_words(self, words):
+        while words and re.match(r"^\w+=", words[0]):
+            words = words[1:]
+        if not words:
+            return
+        name = os.path.basename(words[0])
+        args = words[1:]
+
+        if name in ("env", "command", "exec", "nohup", "time", "sudo", "stdbuf", "nice", "timeout"):
+            self.check_words(skip_wrapper_options(name, args))
+        elif name == "xargs":
+            self.check_words(skip_xargs_options(args))
+        elif name == "creds" and args[:1] == ["run"] and "--" in args:
+            self.check_words(args[args.index("--") + 1:])
+        elif name in SHELLS:
+            flags = [a for a in args if a.startswith("-") and not a.startswith("--")]
+            if any("c" in flag for flag in flags):
+                script = next((a for a in args if not a.startswith("-")), "")
+                self.check(script)
+            elif any(not a.startswith("-") for a in args):
+                raise Blocked(f"{name} runs a script file")
+        elif INTERPRETER.match(name):
+            raise Blocked(f"{name} can write files")
+        elif name in EDITORS:
+            raise Blocked(f"{name} edits files")
+        elif name == "sed":
+            if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
+                raise Blocked("sed -i edits files in place")
+        elif name in ("awk", "gawk"):
+            joined = " ".join(args)
+            if re.search(r"(^|\s)-i\s*inplace|--include[= ]inplace", joined):
+                raise Blocked("awk -i inplace edits files in place")
+        elif name == "tee":
+            for path in operands(args):
+                self.require(path, "tee")
+        elif name == "rm":
+            for path in operands(args):
+                if not (self.allowed(path) or self.empty_note(path)):
+                    raise Blocked(f"rm deletes {path}, which is not an empty note")
+        elif name in ALL_PATHS_WRITTEN:
+            for path in operands(args):
+                self.require(path, name)
+        elif name in DESTINATION_WRITTEN:
+            paths = operands(args)
+            target = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-t", "--target-directory")), None)
+            if target or paths:
+                self.require(target or paths[-1], name)
+        elif name == "dd":
+            for arg in args:
+                if arg.startswith("of="):
+                    self.require(arg[3:], "dd")
+        elif name == "curl":
+            self.check_curl(args)
+        elif name == "wget":
+            self.check_wget(args)
+        elif name == "find":
+            self.check_find(args)
+
+    def check_curl(self, args):
+        for i, arg in enumerate(args):
+            value = args[i + 1] if i + 1 < len(args) else ""
+            if arg in ("-O", "--remote-name", "--remote-name-all", "-J", "--remote-header-name"):
+                raise Blocked("curl -O writes a file")
+            if arg in ("-o", "--output"):
+                self.require(value, "curl -o")
+            elif arg.startswith("--output="):
+                self.require(arg.split("=", 1)[1], "curl -o")
+            elif re.match(r"^-[a-zA-Z]+$", arg) and not arg.startswith("--"):
+                if "O" in arg:
+                    raise Blocked("curl -O writes a file")
+                if arg.endswith("o"):
+                    self.require(value, "curl -o")
+                elif "o" in arg:
+                    self.require(arg[arg.index("o") + 1:], "curl -o")
+
+    def check_wget(self, args):
+        if "--spider" in args:
+            return
+        for i, arg in enumerate(args):
+            if arg in ("-O", "--output-document") and i + 1 < len(args):
+                self.require(args[i + 1], "wget -O")
+                return
+            if arg.startswith("--output-document="):
+                self.require(arg.split("=", 1)[1], "wget -O")
+                return
+        raise Blocked("wget writes a file")
+
+    def check_find(self, args):
+        roots = []
+        for arg in args:
+            if arg.startswith("-") or arg in ("!", "("):
+                break
+            roots.append(arg)
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "-delete":
+                for root in roots or ["."]:
+                    self.require(root, "find -delete")
+            elif arg in ("-fprint", "-fprint0", "-fprintf", "-fls") and index + 1 < len(args):
+                self.require(args[index + 1], f"find {arg}")
+            elif arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                end = index + 1
+                while end < len(args) and args[end] not in (";", "+"):
+                    end += 1
+                self.check_words(args[index + 1:end])
+                index = end
+            index += 1
+
+
+def operands(args):
+    return [a for a in args if not a.startswith("-")]
+
+
+def skip_wrapper_options(name, args):
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if name == "env" and (re.match(r"^\w+=", arg) or arg in ("-i", "-")):
+            index += 1
+        elif name == "env" and arg in ("-u", "--unset", "-C", "--chdir"):
+            index += 2
+        elif name in ("nice", "stdbuf") and arg in ("-n", "-i", "-o", "-e"):
+            index += 2
+        elif name == "timeout" and arg in ("-s", "--signal", "-k", "--kill-after"):
+            index += 2
+        elif arg.startswith("-"):
+            index += 1
+        elif name == "timeout" and re.match(r"^\d+(\.\d+)?[smhd]?$", arg):
+            return args[index + 1:]
+        else:
+            return args[index:]
+    return []
+
+
+def skip_xargs_options(args):
+    with_value = {"-I", "-i", "-n", "-P", "-d", "-L", "-s", "-a", "-E", "--delimiter", "--max-args"}
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in with_value else 1
+    return args[index:]
+
+
+def strip_heredoc_bodies(command):
+    lines = command.split("\n")
+    kept = []
+    delimiter = None
+    for line in lines:
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                delimiter = None
+            continue
+        kept.append(line)
+        match = HEREDOC.search(line.replace("<<<", "   "))
+        if match:
+            delimiter = match.group(2)
+    return "\n".join(kept)
+
+
+def main():
+    payload = json.load(sys.stdin)
+    if payload.get("tool_name") != "Bash":
+        return 0
+    command = payload.get("tool_input", {}).get("command", "")
+    try:
+        scratch = os.environ.get("SCIENTIA_SCRATCH", "/tmp")
+        Guard(payload.get("cwd") or os.getcwd(), scratch).check(command)
+    except Blocked as reason:
+        print(f"Blocked by scientia: {reason}. Bash must not write files: change vault notes "
+              "with the Edit and Write tools, one Edit per change, and use /tmp for scratch "
+              "files.", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

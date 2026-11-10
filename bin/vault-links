@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""List wikilinks in the Obsidian vault that resolve to no file, for /links.
+
+Resolution follows Obsidian: [[target#heading|text]] and ![[embed]] match a file
+case-insensitively by vault-relative path (".md" optional), by a trailing part of its
+path, or by name anywhere. Links in code spans and fenced blocks are not links.
+.obsidian/ and _templates/ are not scanned. Output, most-referenced first:
+
+    <target> — N refs: <source>, ...
+      candidates: <note>, ...        (close matches by name, title or alias; if any)
+
+Targets containing < > { } are template placeholders and are prefixed "malformed ".
+Notes with no content beyond frontmatter, which Obsidian creates when an unresolved link
+is clicked, are listed as "empty <path>" with the links that resolve to them.
+"""
+
+import argparse
+import collections
+import difflib
+import os
+import re
+import sys
+from pathlib import Path
+
+SKIPPED_DIRS = {".obsidian", "_templates", ".trash"}
+FENCE = re.compile(r"^(`{3,}|~{3,}).*?^\1[^\S\n]*$", re.M | re.S)
+CODE_SPAN = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.S)
+LINK = re.compile(r"!?\[\[([^\[\]\n]+?)\]\]")
+PLACEHOLDER = re.compile(r"[<>{}]")
+FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+
+
+def scanned_files(vault):
+    for path in sorted(vault.rglob("*")):
+        relative = path.relative_to(vault)
+        if path.is_file() and not SKIPPED_DIRS.intersection(relative.parts[:-1]):
+            yield relative
+
+
+def link_targets(text):
+    text = CODE_SPAN.sub("", FENCE.sub("", text))
+    for match in LINK.finditer(text):
+        target = match.group(1).split("|", 1)[0].rstrip("\\").split("#", 1)[0].strip()
+        if target:  # [[#heading]] links within the same note
+            yield target
+
+
+def aliases(text):
+    frontmatter = FRONTMATTER.match(text)
+    if not frontmatter:
+        return []
+    block = re.search(r"^aliases:[ \t]*(.*?)(?=^\S|\Z)", frontmatter.group(1), re.M | re.S)
+    if not block:
+        return []
+    value = block.group(1).strip()
+    if value.startswith("["):
+        items = value.strip("[]").split(",")
+    else:
+        items = [line.strip()[1:] for line in value.splitlines() if line.strip().startswith("-")]
+    return [item.strip().strip("'\"") for item in items if item.strip()]
+
+
+def title(text):
+    heading = re.search(r"^# (.+)$", text, re.M)
+    return heading.group(1).strip() if heading else ""
+
+
+def is_empty(text):
+    return not FRONTMATTER.sub("", text, count=1).strip()
+
+
+class Index:
+    def __init__(self, vault, files):
+        self.paths = {}           # lowercase key (".md" dropped for notes) -> relative path
+        self.names = {}           # searchable name -> note path, for candidates
+        self.empty = set()        # relative paths of notes with no content
+        for relative in files:
+            key = relative.as_posix().lower()
+            if relative.suffix == ".md":
+                key = key[:-3]
+                text = (vault / relative).read_text(errors="replace")
+                if is_empty(text):
+                    self.empty.add(relative.as_posix())
+                else:
+                    for name in [relative.stem, title(text), *aliases(text)]:
+                        if name:
+                            self.names.setdefault(name.lower(), relative.as_posix())
+            self.paths[key] = relative.as_posix()
+
+    def resolve(self, target):
+        """The file a link resolves to, or None. Like Obsidian, the shortest path wins."""
+        key = target.lstrip("/").lower()
+        if key.endswith(".md"):
+            key = key[:-3]
+        if key in self.paths:
+            return self.paths[key]
+        matches = [path for k, path in self.paths.items() if k.endswith("/" + key)]
+        return min(matches, key=lambda p: (p.count("/"), p)) if matches else None
+
+    def candidates(self, target):
+        name = target.rstrip("/").rsplit("/", 1)[-1].lower()
+        squashed = {re.sub(r"[\s_-]", "", n): path for n, path in self.names.items()}
+        matches = difflib.get_close_matches(name, self.names, n=3, cutoff=0.75)
+        found = [self.names[m] for m in matches]
+        for m in difflib.get_close_matches(re.sub(r"[\s_-]", "", name), squashed, n=3, cutoff=0.8):
+            found.append(squashed[m])
+        return list(dict.fromkeys(found))[:3]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--vault", type=Path, default=Path(os.environ.get("SCIENTIA_VAULT") or "/vault"))
+    vault = parser.parse_args().vault
+    if not vault.is_dir():
+        parser.error(f"{vault} is not a directory")
+
+    files = list(scanned_files(vault))
+    index = Index(vault, files)
+    references = collections.defaultdict(list)
+    for path in index.empty:
+        references["empty " + path] = []
+    for relative in files:
+        if relative.suffix != ".md":
+            continue
+        for target in link_targets((vault / relative).read_text(errors="replace")):
+            resolved = index.resolve(target)
+            if PLACEHOLDER.search(target):
+                references["malformed " + target].append(relative.as_posix())
+            elif resolved in index.empty:
+                references["empty " + resolved].append(relative.as_posix())
+            elif resolved is None:
+                references[target].append(relative.as_posix())
+
+    def order(item):
+        entry, sources = item
+        name = entry.split(" ", 1)[1] if entry.startswith(("empty ", "malformed ")) else entry
+        return -len(sources), name.lower()
+
+    for entry, sources in sorted(references.items(), key=order):
+        noun = "ref" if len(sources) == 1 else "refs"
+        listed = f": {', '.join(dict.fromkeys(sources))}" if sources else ""
+        print(f"{entry} — {len(sources)} {noun}{listed}")
+        candidates = [] if entry.startswith(("empty ", "malformed ")) else index.candidates(entry)
+        if candidates:
+            print(f"  candidates: {', '.join(candidates)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

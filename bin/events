@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Emit scientia session events, one per line, as a coding agent's event stream.
+
+    new <path>   (--inbox) a file has appeared and stopped changing, reported once
+    tick         (--inbox) every --tick seconds, the cue to chase notes needing context
+    daily        (--daily) the local time has passed HH:MM[:SS] since the last check
+    index        (--index-interval) every N seconds, the cue to refresh the search index
+
+Inbox files already present at startup are reported, so re-arming after a timeout is
+safe. A --daily time already past at startup does not fire; the session catches up on
+start instead. Inbox subdirectories (processed/ lives there), dotfiles and editor temp
+files are ignored.
+"""
+
+import argparse
+import datetime
+import fnmatch
+import re
+import sys
+import time
+from pathlib import Path
+
+IGNORED = (".*", "*~", "*.swp", "*.swx", "*.tmp", "*.part", "#*#")
+
+
+def daily_time(value):
+    if not re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", value):
+        raise argparse.ArgumentTypeError(f"{value} is not HH:MM or HH:MM:SS")
+    parts = [int(part) for part in value.split(":")]
+    try:
+        return datetime.time(*parts)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error))
+
+
+class Inbox:
+    def __init__(self, directory, tick):
+        self.directory = directory
+        self.tick = tick
+        self.last_signature = {}
+        self.reported = set()
+        self.next_tick = time.monotonic() + tick
+
+    def poll(self):
+        present = set()
+        for path in sorted(self.directory.iterdir()):
+            try:
+                if not path.is_file() or any(fnmatch.fnmatch(path.name, p) for p in IGNORED):
+                    continue
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            current = stat.st_size, stat.st_mtime_ns
+            present.add(path)
+            if path in self.reported:
+                continue
+            # Report only once a file is unchanged across a poll, so half-written drops wait.
+            if self.last_signature.get(path) == current:
+                emit(f"new {path}")
+                self.reported.add(path)
+            self.last_signature[path] = current
+
+        # Forget files that were filed away, so a later drop with the same name is reported.
+        self.reported &= present
+        self.last_signature = {p: s for p, s in self.last_signature.items() if p in present}
+
+        if time.monotonic() >= self.next_tick:
+            emit("tick")
+            self.next_tick = time.monotonic() + self.tick
+
+
+class Every:
+    def __init__(self, seconds, event):
+        self.seconds = seconds
+        self.event = event
+        self.due = time.monotonic() + seconds
+
+    def poll(self):
+        if time.monotonic() >= self.due:
+            emit(self.event)
+            self.due = time.monotonic() + self.seconds
+
+
+class Daily:
+    def __init__(self, at):
+        self.at = at
+        self.last_check = datetime.datetime.now()
+
+    def poll(self):
+        now = datetime.datetime.now()
+        due = datetime.datetime.combine(now.date(), self.at)
+        if self.last_check < due <= now:
+            emit("daily")
+        self.last_check = now
+
+
+def emit(event):
+    print(event, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--inbox", type=Path, help="notes inbox to watch")
+    parser.add_argument("--tick", type=float, default=1800.0, help="tick period, seconds")
+    parser.add_argument("--daily", type=daily_time, help="local time for the daily event")
+    parser.add_argument("--index-interval", type=float, help="index event period, seconds")
+    parser.add_argument("--interval", type=float, default=2.0, help="poll period, seconds")
+    args = parser.parse_args()
+
+    sources = []
+    if args.inbox:
+        if not args.inbox.is_dir():
+            parser.error(f"{args.inbox} is not a directory")
+        sources.append(Inbox(args.inbox, args.tick))
+    if args.daily:
+        sources.append(Daily(args.daily))
+    if args.index_interval:
+        sources.append(Every(args.index_interval, "index"))
+
+    while True:
+        for source in sources:
+            source.poll()
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Read the scientia credentials file without exposing token values.
+
+The file holds fine-grained access tokens, each paired with the service it is for:
+
+    NAME=<token>
+    NAME_SERVICE=<service>     # lowercase, e.g. github, linear
+
+Blank lines and lines starting with # are ignored. The file must not be readable by
+group or others.
+
+    creds check                 validate the file (the launcher runs this on the host)
+    creds list                  print "NAME service" per token, never the values
+    creds run NAME -- CMD...    run CMD with the token in NAME and in the service's
+                                conventional variables (e.g. GH_TOKEN for github)
+"""
+
+import argparse
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+DEFAULT_FILE = Path.home() / ".config" / "scientia" / "creds"
+NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+SERVICE = re.compile(r"[a-z][a-z0-9-]*")
+SUFFIX = "_SERVICE"
+
+# Variables each service's own tooling reads, set alongside NAME by `creds run`.
+SERVICE_VARIABLES = {
+    "github": ["GH_TOKEN", "GITHUB_TOKEN"],
+    "gitlab": ["GITLAB_TOKEN"],
+    "linear": ["LINEAR_API_KEY"],
+    "jira": ["JIRA_API_TOKEN"],
+    "slack": ["SLACK_TOKEN"],
+}
+
+
+class CredsError(Exception):
+    pass
+
+
+def load(path):
+    """Return {name: (token, service)}. Errors cite line numbers, never values."""
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        raise CredsError(f"{path} does not exist")
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise CredsError(f"{path} is accessible by group or others; chmod 600 it")
+
+    entries = {}
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or not NAME.fullmatch(key):
+            raise CredsError(f"{path}:{number}: expected NAME=value with an uppercase NAME")
+        if not value:
+            raise CredsError(f"{path}:{number}: {key} has an empty value")
+        if key in entries:
+            raise CredsError(f"{path}:{number}: {key} is defined twice")
+        entries[key] = value
+
+    tokens = {}
+    for key, value in entries.items():
+        if key.endswith(SUFFIX):
+            if key[: -len(SUFFIX)] not in entries:
+                raise CredsError(f"{path}: {key} has no token {key[: -len(SUFFIX)]}")
+            if not SERVICE.fullmatch(value):
+                raise CredsError(f"{path}: {key} must be a lowercase service name")
+            continue
+        service = entries.get(key + SUFFIX)
+        if service is None:
+            raise CredsError(f"{path}: {key} has no {key}{SUFFIX} line naming its service")
+        tokens[key] = (value, service)
+    return tokens
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--file", type=Path,
+                        default=Path(os.environ.get("SCIENTIA_CREDS") or DEFAULT_FILE))
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("check")
+    commands.add_parser("list")
+    run = commands.add_parser("run")
+    run.add_argument("name")
+    run.add_argument("argv", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    try:
+        tokens = load(args.file)
+    except CredsError as error:
+        print(f"creds: {error}", file=sys.stderr)
+        return 2
+
+    if args.command == "list":
+        for name, (_, service) in tokens.items():
+            print(f"{name} {service}")
+    elif args.command == "run":
+        argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        if args.name not in tokens:
+            print(f"creds: no token named {args.name}; see `creds list`", file=sys.stderr)
+            return 2
+        if not argv:
+            parser.error("run needs a command after --")
+        token, service = tokens[args.name]
+        env = dict(os.environ)
+        for variable in [args.name, *SERVICE_VARIABLES.get(service, [])]:
+            env[variable] = token
+        os.execvpe(argv[0], argv, env)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
